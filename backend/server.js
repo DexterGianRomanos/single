@@ -4,21 +4,70 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,https://single-webapp.vercel.app').split(',').map((origin) => origin.trim()).filter(Boolean);
+
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST']
+}));
 
 const server = http.createServer(app);
 const io = new Server(server, {
   maxHttpBufferSize: 15e6, // 15 MB limit for base64 image attachments
   cors: {
-    origin: '*', // Allows local development and cross-origin socket connections
-    methods: ['GET', 'POST']
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error('Not allowed by CORS'));
+    },
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 
 // State Management
 let waitingQueue = [];
 const activePairs = new Map();
+const queueTimeouts = new Map();
+const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS || 20000);
+
+function clearQueueTimeout(socketId) {
+  const timer = queueTimeouts.get(socketId);
+  if (timer) {
+    clearTimeout(timer);
+    queueTimeouts.delete(socketId);
+  }
+}
+
+function scheduleQueueTimeout(socketId) {
+  clearQueueTimeout(socketId);
+
+  const timer = setTimeout(() => {
+    waitingQueue = waitingQueue.filter((user) => user.socketId !== socketId);
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.emit('queue_timeout', {
+        message: 'No partner found. Please try again.'
+      });
+    }
+    broadcastStats();
+    queueTimeouts.delete(socketId);
+  }, QUEUE_TIMEOUT_MS);
+
+  queueTimeouts.set(socketId, timer);
+}
 
 /**
  * Broadcasts real-time statistics (total connected sockets and current queue size)
@@ -43,6 +92,7 @@ io.on('connection', (socket) => {
   socket.on('find_chatmate', ({ gender, filterGender, location }) => {
     // Remove user if they were already in queue to avoid duplicate entries
     waitingQueue = waitingQueue.filter((u) => u.socketId !== socket.id);
+    clearQueueTimeout(socket.id);
 
     socket.userProfile = {
       gender: gender || 'Unspecified',
@@ -57,6 +107,7 @@ io.on('connection', (socket) => {
     });
 
     socket.emit('queue_status', { message: 'Searching for a chatmate...' });
+    scheduleQueueTimeout(socket.id);
 
     broadcastStats();
     tryMatchUsers();
@@ -83,6 +134,9 @@ io.on('connection', (socket) => {
           const s2 = io.sockets.sockets.get(u2.socketId);
 
           if (s1 && s2) {
+            clearQueueTimeout(u1.socketId);
+            clearQueueTimeout(u2.socketId);
+
             const roomId = `room_${u1.socketId}_${u2.socketId}`;
             s1.join(roomId);
             s2.join(roomId);
@@ -134,17 +188,20 @@ io.on('connection', (socket) => {
   // 3. LEAVE CHAT & DISCONNECT HANDLERS
   // ----------------------------------------------------
   socket.on('leave_chat', () => {
+    clearQueueTimeout(socket.id);
     handleUserLeave(socket);
   });
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
+    clearQueueTimeout(socket.id);
     waitingQueue = waitingQueue.filter((u) => u.socketId !== socket.id);
     handleUserLeave(socket);
     broadcastStats();
   });
 
   function handleUserLeave(sock) {
+    clearQueueTimeout(sock.id);
     const pair = activePairs.get(sock.id);
     if (pair) {
       const { roomId, partnerId } = pair;
